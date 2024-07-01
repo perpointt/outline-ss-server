@@ -26,7 +26,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Jigsaw-Code/outline-sdk/transport"
 	"github.com/Jigsaw-Code/outline-sdk/transport/shadowsocks"
 	"github.com/Jigsaw-Code/outline-ss-server/ipinfo"
 	"github.com/Jigsaw-Code/outline-ss-server/service"
@@ -91,14 +90,7 @@ func (s *SSServer) startPort(portNum int) error {
 	tcpHandler := service.NewTCPHandler(portNum, authFunc, s.m, tcpReadTimeout)
 	packetHandler := service.NewPacketHandler(s.natTimeout, port.cipherList, s.m)
 	s.ports[portNum] = port
-	accept := func() (transport.StreamConn, error) {
-		conn, err := listener.AcceptTCP()
-		if err == nil {
-			conn.SetKeepAlive(true)
-		}
-		return conn, err
-	}
-	go service.StreamServe(accept, tcpHandler.Handle)
+	go service.StreamServe(service.WrapStreamListener(listener.AcceptTCP), tcpHandler.Handle)
 	go packetHandler.Handle(port.packetConn)
 	return nil
 }
