@@ -37,7 +37,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/term"
-	"gopkg.in/yaml.v2"
 )
 
 var logLevel = new(slog.LevelVar) // Info by default
@@ -68,10 +67,18 @@ type SSServer struct {
 }
 
 func (s *SSServer) loadConfig(filename string) error {
-	config, err := readConfig(filename)
+	configData, err := os.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read config file %s: %w", filename, err)
+	}
+	config, err := readConfig(configData)
 	if err != nil {
 		return fmt.Errorf("failed to load config (%v): %w", filename, err)
 	}
+	if err := config.Validate(); err != nil {
+		return fmt.Errorf("failed to validate config: %w", err)
+	}
+
 	// We hot swap the config by having the old and new listeners both live at
 	// the same time. This means we create listeners for the new config first,
 	// and then close the old ones after.
@@ -86,6 +93,33 @@ func (s *SSServer) loadConfig(filename string) error {
 	return nil
 }
 
+func newCipherListFromConfig(config ServiceConfig) (service.CipherList, error) {
+	type cipherKey struct {
+		cipher string
+		secret string
+	}
+	cipherList := list.New()
+	existingCiphers := make(map[cipherKey]bool)
+	for _, keyConfig := range config.Keys {
+		key := cipherKey{keyConfig.Cipher, keyConfig.Secret}
+		if _, exists := existingCiphers[key]; exists {
+			slog.Debug("Encryption key already exists. Skipping.", "id", keyConfig.ID)
+			continue
+		}
+		cryptoKey, err := shadowsocks.NewEncryptionKey(keyConfig.Cipher, keyConfig.Secret)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create encyption key for key %v: %w", keyConfig.ID, err)
+		}
+		entry := service.MakeCipherEntry(keyConfig.ID, cryptoKey, keyConfig.Secret)
+		cipherList.PushBack(&entry)
+		existingCiphers[key] = true
+	}
+	ciphers := service.NewCipherList()
+	ciphers.Update(cipherList)
+
+	return ciphers, nil
+}
+
 func (s *SSServer) NewShadowsocksStreamHandler(ciphers service.CipherList) service.StreamHandler {
 	authFunc := service.NewShadowsocksStreamAuthenticator(ciphers, &s.replayCache, s.m.tcpServiceMetrics)
 	// TODO: Register initial data metrics at zero.
@@ -94,6 +128,22 @@ func (s *SSServer) NewShadowsocksStreamHandler(ciphers service.CipherList) servi
 
 func (s *SSServer) NewShadowsocksPacketHandler(ciphers service.CipherList) service.PacketHandler {
 	return service.NewPacketHandler(s.natTimeout, ciphers, s.m, s.m.udpServiceMetrics)
+}
+
+func (s *SSServer) NewShadowsocksStreamHandlerFromConfig(config ServiceConfig) (service.StreamHandler, error) {
+	ciphers, err := newCipherListFromConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	return s.NewShadowsocksStreamHandler(ciphers), nil
+}
+
+func (s *SSServer) NewShadowsocksPacketHandlerFromConfig(config ServiceConfig) (service.PacketHandler, error) {
+	ciphers, err := newCipherListFromConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	return s.NewShadowsocksPacketHandler(ciphers), nil
 }
 
 type listenerSet struct {
@@ -172,6 +222,7 @@ func (s *SSServer) runConfig(config Config) (func() error, error) {
 		}()
 
 		startErrCh <- func() error {
+			totalCipherCount := len(config.Keys)
 			portCiphers := make(map[int]*list.List) // Values are *List of *CipherEntry.
 			for _, keyConfig := range config.Keys {
 				cipherList, ok := portCiphers[keyConfig.Port]
@@ -197,7 +248,7 @@ func (s *SSServer) runConfig(config Config) (func() error, error) {
 				if err != nil {
 					return err
 				}
-				slog.Info("Shadowsocks TCP service started.", "address", ln.Addr().String())
+				slog.Info("TCP service started.", "address", ln.Addr().String())
 				go service.StreamServe(ln.AcceptStream, func(ctx context.Context, conn transport.StreamConn) {
 					connMetrics := s.m.AddOpenTCPConnection(conn)
 					sh.Handle(ctx, conn, connMetrics)
@@ -207,12 +258,54 @@ func (s *SSServer) runConfig(config Config) (func() error, error) {
 				if err != nil {
 					return err
 				}
-				slog.Info("Shadowsocks UDP service started.", "address", pc.LocalAddr().String())
+				slog.Info("UDP service started.", "address", pc.LocalAddr().String())
 				ph := s.NewShadowsocksPacketHandler(ciphers)
 				go ph.Handle(pc)
 			}
-			slog.Info("Loaded config.", "access keys", len(config.Keys), "listeners", lnSet.Len())
-			s.m.SetNumAccessKeys(len(config.Keys), lnSet.Len())
+
+			for _, serviceConfig := range config.Services {
+				var (
+					sh service.StreamHandler
+					ph service.PacketHandler
+				)
+				for _, lnConfig := range serviceConfig.Listeners {
+					switch lnConfig.Type {
+					case listenerTypeTCP:
+						ln, err := lnSet.ListenStream(lnConfig.Address)
+						if err != nil {
+							return err
+						}
+						slog.Info("TCP service started.", "address", ln.Addr().String())
+						if sh == nil {
+							sh, err = s.NewShadowsocksStreamHandlerFromConfig(serviceConfig)
+							if err != nil {
+								return err
+							}
+						}
+						go service.StreamServe(ln.AcceptStream, func(ctx context.Context, conn transport.StreamConn) {
+							connMetrics := s.m.AddOpenTCPConnection(conn)
+							sh.Handle(ctx, conn, connMetrics)
+						})
+					case listenerTypeUDP:
+						pc, err := lnSet.ListenPacket(lnConfig.Address)
+						if err != nil {
+							return err
+						}
+						slog.Info("UDP service started.", "address", pc.LocalAddr().String())
+						if ph == nil {
+							ph, err = s.NewShadowsocksPacketHandlerFromConfig(serviceConfig)
+							if err != nil {
+								return err
+							}
+						}
+						go ph.Handle(pc)
+					}
+				}
+				totalCipherCount += len(serviceConfig.Keys)
+			}
+
+			slog.Info("Loaded config.", "access_keys", totalCipherCount, "listeners", lnSet.Len())
+			s.m.SetNumAccessKeys(totalCipherCount, lnSet.Len())
 			return nil
 		}()
 
@@ -270,28 +363,6 @@ func RunSSServer(filename string, natTimeout time.Duration, sm *outlineMetrics, 
 		}
 	}()
 	return server, nil
-}
-
-type Config struct {
-	Keys []struct {
-		ID     string
-		Port   int
-		Cipher string
-		Secret string
-	}
-}
-
-func readConfig(filename string) (*Config, error) {
-	config := Config{}
-	configData, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config: %w", err)
-	}
-	err = yaml.Unmarshal(configData, &config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse config: %w", err)
-	}
-	return &config, nil
 }
 
 func main() {
