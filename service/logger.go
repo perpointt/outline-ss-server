@@ -14,6 +14,13 @@
 
 package service
 
-import logging "github.com/op/go-logging"
+import (
+	"io"
+	"log/slog"
+	"math"
+)
 
-var logger = logging.MustGetLogger("shadowsocks")
+func noopLogger() *slog.Logger {
+	// TODO: Use built-in no-op log level when available: https://go.dev/issue/62005
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.Level(math.MaxInt)}))
+}

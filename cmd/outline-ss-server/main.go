@@ -222,6 +222,7 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 					service.WithNatTimeout(s.natTimeout),
 					service.WithMetrics(s.serviceMetrics),
 					service.WithReplayCache(&s.replayCache),
+					service.WithLogger(slog.Default()),
 				)
 				ln, err := lnSet.ListenStream(addr)
 				if err != nil {
@@ -248,6 +249,7 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 					service.WithNatTimeout(s.natTimeout),
 					service.WithMetrics(s.serviceMetrics),
 					service.WithReplayCache(&s.replayCache),
+					service.WithLogger(slog.Default()),
 				)
 				if err != nil {
 					return err
