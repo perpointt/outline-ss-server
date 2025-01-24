@@ -117,7 +117,7 @@ func newTCPConnMetrics(tcpServiceMetrics *tcpServiceMetrics, tunnelTimeMetrics *
 	}
 }
 
-func (cm *tcpConnMetrics) AddAuthenticated(accessKey string) {
+func (cm *tcpConnMetrics) AddAuthentication(accessKey string) {
 	cm.accessKey = accessKey
 	ipKey, err := toIPKey(cm.clientAddr, accessKey)
 	if err == nil {
@@ -125,7 +125,7 @@ func (cm *tcpConnMetrics) AddAuthenticated(accessKey string) {
 	}
 }
 
-func (cm *tcpConnMetrics) AddClosed(status string, data metrics.ProxyMetrics, duration time.Duration) {
+func (cm *tcpConnMetrics) AddClose(status string, data metrics.ProxyMetrics, duration time.Duration) {
 	cm.tcpServiceMetrics.proxyCollector.addClientTarget(data.ClientProxy, data.ProxyTarget, cm.accessKey, cm.clientInfo)
 	cm.tcpServiceMetrics.proxyCollector.addTargetClient(data.TargetProxy, data.ProxyClient, cm.accessKey, cm.clientInfo)
 	cm.tcpServiceMetrics.closeConnection(status, duration, cm.accessKey, cm.clientInfo)
@@ -250,20 +250,22 @@ type udpConnMetrics struct {
 	accessKey  string
 }
 
-var _ service.UDPConnMetrics = (*udpConnMetrics)(nil)
+var _ service.UDPAssociationMetrics = (*udpConnMetrics)(nil)
 
-func newUDPConnMetrics(udpServiceMetrics *udpServiceMetrics, tunnelTimeMetrics *tunnelTimeMetrics, accessKey string, clientAddr net.Addr, clientInfo ipinfo.IPInfo) *udpConnMetrics {
-	udpServiceMetrics.addNatEntry()
-	ipKey, err := toIPKey(clientAddr, accessKey)
-	if err == nil {
-		tunnelTimeMetrics.startConnection(*ipKey)
-	}
+func newUDPAssociationMetrics(udpServiceMetrics *udpServiceMetrics, tunnelTimeMetrics *tunnelTimeMetrics, clientAddr net.Addr, clientInfo ipinfo.IPInfo) *udpConnMetrics {
 	return &udpConnMetrics{
 		udpServiceMetrics: udpServiceMetrics,
 		tunnelTimeMetrics: tunnelTimeMetrics,
-		accessKey:         accessKey,
 		clientAddr:        clientAddr,
 		clientInfo:        clientInfo,
+	}
+}
+
+func (cm *udpConnMetrics) AddAuthentication(accessKey string) {
+	cm.accessKey = accessKey
+	ipKey, err := toIPKey(cm.clientAddr, accessKey)
+	if err == nil {
+		cm.tunnelTimeMetrics.startConnection(*ipKey)
 	}
 }
 
@@ -275,12 +277,14 @@ func (cm *udpConnMetrics) AddPacketFromTarget(status string, targetProxyBytes, p
 	cm.udpServiceMetrics.addPacketFromTarget(status, targetProxyBytes, proxyClientBytes, cm.accessKey, cm.clientInfo)
 }
 
-func (cm *udpConnMetrics) RemoveNatEntry() {
-	cm.udpServiceMetrics.removeNatEntry()
-
-	ipKey, err := toIPKey(cm.clientAddr, cm.accessKey)
-	if err == nil {
-		cm.tunnelTimeMetrics.stopConnection(*ipKey)
+func (cm *udpConnMetrics) AddClose() {
+	// We only track authenticated connections, so ignore unauthenticated closed connections
+	// when calculating tunneltime.
+	if cm.accessKey != "" {
+		ipKey, err := toIPKey(cm.clientAddr, cm.accessKey)
+		if err == nil {
+			cm.tunnelTimeMetrics.stopConnection(*ipKey)
+		}
 	}
 }
 
@@ -288,8 +292,6 @@ type udpServiceMetrics struct {
 	proxyCollector *proxyCollector
 	// NOTE: New metrics need to be added to `newUDPCollector()`, `Describe()` and `Collect()`.
 	packetsFromClientPerLocation *prometheus.CounterVec
-	addedNatEntries              prometheus.Counter
-	removedNatEntries            prometheus.Counter
 	timeToCipherMs               prometheus.ObserverVec
 }
 
@@ -315,18 +317,6 @@ func newUDPCollector() (*udpServiceMetrics, error) {
 				Name:      "packets_from_client_per_location",
 				Help:      "Packets received from the client, per location and status",
 			}, []string{"location", "asn", "asorg", "status"}),
-		addedNatEntries: prometheus.NewCounter(
-			prometheus.CounterOpts{
-				Namespace: namespace,
-				Name:      "nat_entries_added",
-				Help:      "Entries added to the UDP NAT table",
-			}),
-		removedNatEntries: prometheus.NewCounter(
-			prometheus.CounterOpts{
-				Namespace: namespace,
-				Name:      "nat_entries_removed",
-				Help:      "Entries removed from the UDP NAT table",
-			}),
 	}, nil
 }
 
@@ -334,24 +324,12 @@ func (c *udpServiceMetrics) Describe(ch chan<- *prometheus.Desc) {
 	c.proxyCollector.Describe(ch)
 	c.timeToCipherMs.Describe(ch)
 	c.packetsFromClientPerLocation.Describe(ch)
-	c.addedNatEntries.Describe(ch)
-	c.removedNatEntries.Describe(ch)
 }
 
 func (c *udpServiceMetrics) Collect(ch chan<- prometheus.Metric) {
 	c.proxyCollector.Collect(ch)
 	c.timeToCipherMs.Collect(ch)
 	c.packetsFromClientPerLocation.Collect(ch)
-	c.addedNatEntries.Collect(ch)
-	c.removedNatEntries.Collect(ch)
-}
-
-func (c *udpServiceMetrics) addNatEntry() {
-	c.addedNatEntries.Inc()
-}
-
-func (c *udpServiceMetrics) removeNatEntry() {
-	c.removedNatEntries.Inc()
 }
 
 func (c *udpServiceMetrics) addPacketFromClient(status string, clientProxyBytes, proxyTargetBytes int64, accessKey string, clientInfo ipinfo.IPInfo) {
@@ -531,23 +509,26 @@ func (m *serviceMetrics) getIPInfoFromAddr(addr net.Addr) ipinfo.IPInfo {
 	return ipInfo
 }
 
+// TODO: Split TCP and UDP metrics.
+
 func (m *serviceMetrics) AddOpenTCPConnection(clientConn net.Conn) service.TCPConnMetrics {
 	clientAddr := clientConn.RemoteAddr()
 	clientInfo := m.getIPInfoFromAddr(clientAddr)
 	return newTCPConnMetrics(m.tcpServiceMetrics, m.tunnelTimeMetrics, clientConn, clientInfo)
 }
 
-func (m *serviceMetrics) AddUDPNatEntry(clientAddr net.Addr, accessKey string) service.UDPConnMetrics {
+func (m *serviceMetrics) AddOpenUDPAssociation(clientConn net.Conn) service.UDPAssociationMetrics {
+	clientAddr := clientConn.RemoteAddr()
 	clientInfo := m.getIPInfoFromAddr(clientAddr)
-	return newUDPConnMetrics(m.udpServiceMetrics, m.tunnelTimeMetrics, accessKey, clientAddr, clientInfo)
+	return newUDPAssociationMetrics(m.udpServiceMetrics, m.tunnelTimeMetrics, clientAddr, clientInfo)
 }
 
-func (m *serviceMetrics) AddCipherSearch(proto string, accessKeyFound bool, timeToCipher time.Duration) {
-	if proto == "tcp" {
-		m.tcpServiceMetrics.AddCipherSearch(accessKeyFound, timeToCipher)
-	} else if proto == "udp" {
-		m.udpServiceMetrics.AddCipherSearch(accessKeyFound, timeToCipher)
-	}
+func (m *serviceMetrics) AddTCPCipherSearch(accessKeyFound bool, timeToCipher time.Duration) {
+	m.tcpServiceMetrics.AddCipherSearch(accessKeyFound, timeToCipher)
+}
+
+func (m *serviceMetrics) AddUDPCipherSearch(accessKeyFound bool, timeToCipher time.Duration) {
+	m.udpServiceMetrics.AddCipherSearch(accessKeyFound, timeToCipher)
 }
 
 // addIfNonZero helps avoid the creation of series that are always zero.

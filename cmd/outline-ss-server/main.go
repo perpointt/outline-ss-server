@@ -16,6 +16,7 @@ package main
 
 import (
 	"container/list"
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -27,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Jigsaw-Code/outline-sdk/transport"
 	"github.com/Jigsaw-Code/outline-sdk/transport/shadowsocks"
 	"github.com/lmittmann/tint"
 	"github.com/prometheus/client_golang/prometheus"
@@ -223,11 +225,11 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 				ciphers := service.NewCipherList()
 				ciphers.Update(cipherList)
 
-				ssService, err := service.NewShadowsocksService(
+				streamHandler, associationHandler := service.NewShadowsocksHandlers(
 					service.WithCiphers(ciphers),
-					service.WithNatTimeout(s.natTimeout),
 					service.WithMetrics(s.serviceMetrics),
 					service.WithReplayCache(&s.replayCache),
+					service.WithPacketListener(service.MakeTargetUDPListener(s.natTimeout, 0)),
 					service.WithLogger(slog.Default()),
 				)
 				ln, err := lnSet.ListenStream(addr)
@@ -235,14 +237,18 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 					return err
 				}
 				slog.Info("TCP service started.", "address", ln.Addr().String())
-				go service.StreamServe(ln.AcceptStream, ssService.HandleStream)
+				go service.StreamServe(ln.AcceptStream, func(ctx context.Context, conn transport.StreamConn) {
+					streamHandler.HandleStream(ctx, conn, s.serviceMetrics.AddOpenTCPConnection(conn))
+				})
 
 				pc, err := lnSet.ListenPacket(addr)
 				if err != nil {
 					return err
 				}
 				slog.Info("UDP service started.", "address", pc.LocalAddr().String())
-				go ssService.HandlePacket(pc)
+				go service.PacketServe(pc, func(ctx context.Context, conn net.Conn) {
+					associationHandler.HandleAssociation(ctx, conn, s.serviceMetrics.AddOpenUDPAssociation(conn))
+				}, s.serverMetrics)
 			}
 
 			for _, serviceConfig := range config.Services {
@@ -250,13 +256,12 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 				if err != nil {
 					return fmt.Errorf("failed to create cipher list from config: %v", err)
 				}
-				ssService, err := service.NewShadowsocksService(
+				streamHandler, associationHandler := service.NewShadowsocksHandlers(
 					service.WithCiphers(ciphers),
-					service.WithNatTimeout(s.natTimeout),
 					service.WithMetrics(s.serviceMetrics),
 					service.WithReplayCache(&s.replayCache),
 					service.WithStreamDialer(service.MakeValidatingTCPStreamDialer(onet.RequirePublicIP, serviceConfig.Dialer.Fwmark)),
-					service.WithPacketListener(service.MakeTargetUDPListener(serviceConfig.Dialer.Fwmark)),
+					service.WithPacketListener(service.MakeTargetUDPListener(s.natTimeout, serviceConfig.Dialer.Fwmark)),
 					service.WithLogger(slog.Default()),
 				)
 				if err != nil {
@@ -275,7 +280,9 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 							}
 							return serviceConfig.Dialer.Fwmark
 						}())
-						go service.StreamServe(ln.AcceptStream, ssService.HandleStream)
+						go service.StreamServe(ln.AcceptStream, func(ctx context.Context, conn transport.StreamConn) {
+							streamHandler.HandleStream(ctx, conn, s.serviceMetrics.AddOpenTCPConnection(conn))
+						})
 					case listenerTypeUDP:
 						pc, err := lnSet.ListenPacket(lnConfig.Address)
 						if err != nil {
@@ -287,7 +294,9 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 							}
 							return serviceConfig.Dialer.Fwmark
 						}())
-						go ssService.HandlePacket(pc)
+						go service.PacketServe(pc, func(ctx context.Context, conn net.Conn) {
+							associationHandler.HandleAssociation(ctx, conn, s.serviceMetrics.AddOpenUDPAssociation(conn))
+						}, s.serverMetrics)
 					}
 				}
 				totalCipherCount += len(serviceConfig.Keys)

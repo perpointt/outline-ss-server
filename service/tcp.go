@@ -37,8 +37,8 @@ import (
 
 // TCPConnMetrics is used to report metrics on TCP connections.
 type TCPConnMetrics interface {
-	AddAuthenticated(accessKey string)
-	AddClosed(status string, data metrics.ProxyMetrics, duration time.Duration)
+	AddAuthentication(accessKey string)
+	AddClose(status string, data metrics.ProxyMetrics, duration time.Duration)
 	AddProbe(status, drainResult string, clientProxyBytes int64)
 }
 
@@ -164,6 +164,8 @@ type streamHandler struct {
 	dialer       transport.StreamDialer
 }
 
+var _ StreamHandler = (*streamHandler)(nil)
+
 // NewStreamHandler creates a StreamHandler
 func NewStreamHandler(authenticate StreamAuthenticateFunc, timeout time.Duration) StreamHandler {
 	return &streamHandler{
@@ -176,7 +178,7 @@ func NewStreamHandler(authenticate StreamAuthenticateFunc, timeout time.Duration
 
 // StreamHandler is a handler that handles stream connections.
 type StreamHandler interface {
-	Handle(ctx context.Context, conn transport.StreamConn, connMetrics TCPConnMetrics)
+	HandleStream(ctx context.Context, conn transport.StreamConn, connMetrics TCPConnMetrics)
 	// SetLogger sets the logger used to log messages. Uses a no-op logger if nil.
 	SetLogger(l *slog.Logger)
 	// SetTargetDialer sets the [transport.StreamDialer] to be used to connect to target addresses.
@@ -219,7 +221,7 @@ type StreamHandleFunc func(ctx context.Context, conn transport.StreamConn)
 // StreamServe repeatedly calls `accept` to obtain connections and `handle` to handle them until
 // accept() returns [ErrClosed]. When that happens, all connection handlers will be notified
 // via their [context.Context]. StreamServe will return after all pending handlers return.
-func StreamServe(accept StreamAcceptFunc, handle StreamHandleFunc) {
+func StreamServe(accept StreamAcceptFunc, streamHandle StreamHandleFunc) {
 	var running sync.WaitGroup
 	defer running.Wait()
 	ctx, contextCancel := context.WithCancel(context.Background())
@@ -243,12 +245,12 @@ func StreamServe(accept StreamAcceptFunc, handle StreamHandleFunc) {
 					slog.Warn("Panic in TCP handler. Continuing to listen.", "err", r)
 				}
 			}()
-			handle(ctx, clientConn)
+			streamHandle(ctx, clientConn)
 		}()
 	}
 }
 
-func (h *streamHandler) Handle(ctx context.Context, clientConn transport.StreamConn, connMetrics TCPConnMetrics) {
+func (h *streamHandler) HandleStream(ctx context.Context, clientConn transport.StreamConn, connMetrics TCPConnMetrics) {
 	if connMetrics == nil {
 		connMetrics = &NoOpTCPConnMetrics{}
 	}
@@ -264,7 +266,7 @@ func (h *streamHandler) Handle(ctx context.Context, clientConn transport.StreamC
 		status = connError.Status
 		h.logger.LogAttrs(nil, slog.LevelDebug, "TCP: Error", slog.String("msg", connError.Message), slog.Any("cause", connError.Cause))
 	}
-	connMetrics.AddClosed(status, proxyMetrics, connDuration)
+	connMetrics.AddClose(status, proxyMetrics, connDuration)
 	measuredClientConn.Close() // Closing after the metrics are added aids integration testing.
 	h.logger.LogAttrs(nil, slog.LevelDebug, "TCP: Done.", slog.String("status", status), slog.Duration("duration", connDuration))
 }
@@ -336,7 +338,7 @@ func (h *streamHandler) handleConnection(ctx context.Context, outerConn transpor
 		h.absorbProbe(outerConn, connMetrics, authErr.Status, proxyMetrics)
 		return authErr
 	}
-	connMetrics.AddAuthenticated(id)
+	connMetrics.AddAuthentication(id)
 
 	// Read target address and dial it.
 	tgtAddr, err := getProxyRequest(innerConn)
@@ -387,9 +389,9 @@ type NoOpTCPConnMetrics struct{}
 
 var _ TCPConnMetrics = (*NoOpTCPConnMetrics)(nil)
 
-func (m *NoOpTCPConnMetrics) AddAuthenticated(accessKey string) {}
+func (m *NoOpTCPConnMetrics) AddAuthentication(accessKey string) {}
 
-func (m *NoOpTCPConnMetrics) AddClosed(status string, data metrics.ProxyMetrics, duration time.Duration) {
+func (m *NoOpTCPConnMetrics) AddClose(status string, data metrics.ProxyMetrics, duration time.Duration) {
 }
 
 func (m *NoOpTCPConnMetrics) AddProbe(status, drainResult string, clientProxyBytes int64) {}
