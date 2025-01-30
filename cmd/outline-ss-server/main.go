@@ -17,6 +17,7 @@ package main
 import (
 	"container/list"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -33,6 +34,7 @@ import (
 	"github.com/lmittmann/tint"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/net/websocket"
 	"golang.org/x/term"
 
 	"github.com/Jigsaw-Code/outline-ss-server/ipinfo"
@@ -62,6 +64,16 @@ func init() {
 	)
 }
 
+type HTTPStreamListener struct {
+	service.StreamListener
+}
+
+var _ net.Listener = (*HTTPStreamListener)(nil)
+
+func (t *HTTPStreamListener) Accept() (net.Conn, error) {
+	return t.StreamListener.AcceptStream()
+}
+
 type OutlineServer struct {
 	stopConfig     func() error
 	lnManager      service.ListenerManager
@@ -80,7 +92,7 @@ func (s *OutlineServer) loadConfig(filename string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load config (%v): %w", filename, err)
 	}
-	if err := config.Validate(); err != nil {
+	if err := config.validate(); err != nil {
 		return fmt.Errorf("failed to validate config: %w", err)
 	}
 
@@ -201,6 +213,32 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 		}()
 
 		startErrCh <- func() error {
+			// Start configured web servers.
+			webServers := make(map[string]*http.ServeMux)
+			for _, srvConfig := range config.Web.Servers {
+				if _, exists := webServers[srvConfig.ID]; exists {
+					return fmt.Errorf("web server with ID `%s` already exists", srvConfig.ID)
+				}
+				mux := http.NewServeMux()
+				for _, addr := range srvConfig.Listeners {
+					server := &http.Server{Addr: addr, Handler: mux}
+					ln, err := lnSet.ListenStream(addr)
+					if err != nil {
+						return fmt.Errorf("failed to listen on %s: %w", addr, err)
+					}
+					go func() {
+						defer server.Shutdown(context.Background())
+						err := server.Serve(&HTTPStreamListener{ln})
+						if err != nil && !errors.Is(http.ErrServerClosed, err) && !errors.Is(net.ErrClosed, err) {
+							slog.Error("Failed to run web server.", "err", err, "ID", srvConfig.ID)
+						}
+					}()
+					slog.Info("Web server started.", "ID", srvConfig.ID, "address", addr)
+				}
+				webServers[srvConfig.ID] = mux
+			}
+
+			// Start legacy services.
 			totalCipherCount := len(config.Keys)
 			portCiphers := make(map[int]*list.List) // Values are *List of *CipherEntry.
 			for _, keyConfig := range config.Keys {
@@ -251,6 +289,7 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 				}, s.serverMetrics)
 			}
 
+			// Start services with listeners.
 			for _, serviceConfig := range config.Services {
 				ciphers, err := newCipherListFromConfig(serviceConfig)
 				if err != nil {
@@ -267,10 +306,9 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 				if err != nil {
 					return err
 				}
-				for _, lnConfig := range serviceConfig.Listeners {
-					switch lnConfig.Type {
-					case listenerTypeTCP:
-						ln, err := lnSet.ListenStream(lnConfig.Address)
+				for _, cfg := range serviceConfig.Listeners {
+					if cfg.TCP != nil {
+						ln, err := lnSet.ListenStream(cfg.TCP.Address)
 						if err != nil {
 							return err
 						}
@@ -283,8 +321,8 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 						go service.StreamServe(ln.AcceptStream, func(ctx context.Context, conn transport.StreamConn) {
 							streamHandler.HandleStream(ctx, conn, s.serviceMetrics.AddOpenTCPConnection(conn))
 						})
-					case listenerTypeUDP:
-						pc, err := lnSet.ListenPacket(lnConfig.Address)
+					} else if cfg.UDP != nil {
+						pc, err := lnSet.ListenPacket(cfg.UDP.Address)
 						if err != nil {
 							return err
 						}
@@ -297,6 +335,56 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
 						go service.PacketServe(pc, func(ctx context.Context, conn net.Conn) {
 							associationHandler.HandleAssociation(ctx, conn, s.serviceMetrics.AddOpenUDPAssociation(conn))
 						}, s.serverMetrics)
+					} else if cfg.WebsocketStream != nil {
+						if _, exists := webServers[cfg.WebsocketStream.WebServer]; !exists {
+							return fmt.Errorf("websocket-stream listener references unknown web server `%s`", cfg.WebsocketStream.WebServer)
+						}
+						mux := webServers[cfg.WebsocketStream.WebServer]
+						// TODO: Support a "half-closed" state for WebSockets.
+						handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							handler := func(wsConn *websocket.Conn) {
+								defer wsConn.Close()
+								ctx, contextCancel := context.WithCancel(context.Background())
+								defer contextCancel()
+								// TODO: Get the forwarded client address.
+								raddr, err := transport.MakeNetAddr("tcp", r.RemoteAddr)
+								if err != nil {
+									slog.Error("failed to determine client address", "err", err)
+									w.WriteHeader(http.StatusBadGateway)
+									return
+								}
+								conn := &streamConn{&replaceAddrConn{Conn: wsConn, raddr: raddr}}
+								streamHandler.HandleStream(ctx, conn, s.serviceMetrics.AddOpenTCPConnection(conn))
+							}
+							websocket.Handler(handler).ServeHTTP(w, r)
+						})
+						mux.Handle(cfg.WebsocketStream.Path, http.StripPrefix(cfg.WebsocketStream.Path, handler))
+						slog.Info("WebSocket stream service started.", "ID", cfg.WebsocketStream.WebServer, "path", cfg.WebsocketStream.Path)
+					} else if cfg.WebsocketPacket != nil {
+						if _, exists := webServers[cfg.WebsocketPacket.WebServer]; !exists {
+							return fmt.Errorf("websocket-packet listener references unknown web server `%s`", cfg.WebsocketPacket.WebServer)
+						}
+						mux := webServers[cfg.WebsocketPacket.WebServer]
+						handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							handler := func(wsConn *websocket.Conn) {
+								defer wsConn.Close()
+								ctx, contextCancel := context.WithCancel(context.Background())
+								defer contextCancel()
+								raddr, err := transport.MakeNetAddr("udp", r.RemoteAddr)
+								if err != nil {
+									slog.Error("failed to determine client address", "err", err)
+									w.WriteHeader(http.StatusBadGateway)
+									return
+								}
+								conn := &replaceAddrConn{Conn: wsConn, raddr: raddr}
+								associationHandler.HandleAssociation(ctx, conn, s.serviceMetrics.AddOpenUDPAssociation(conn))
+							}
+							websocket.Handler(handler).ServeHTTP(w, r)
+						})
+						mux.Handle(cfg.WebsocketPacket.Path, http.StripPrefix(cfg.WebsocketPacket.Path, handler))
+						slog.Info("WebSocket packet service started.", "ID", cfg.WebsocketPacket.WebServer, "path", cfg.WebsocketPacket.Path)
+					} else {
+						return fmt.Errorf("unknown listener configuration: %v", cfg)
 					}
 				}
 				totalCipherCount += len(serviceConfig.Keys)
@@ -362,6 +450,32 @@ func RunOutlineServer(filename string, natTimeout time.Duration, serverMetrics *
 		}
 	}()
 	return server, nil
+}
+
+// TODO: Create a dedicated `ClientConn` struct with `ClientAddr` and `Conn`.
+// replaceAddrConn overrides [websocket.Conn]'s remote address handling.
+type replaceAddrConn struct {
+	*websocket.Conn
+	raddr net.Addr
+}
+
+func (c replaceAddrConn) RemoteAddr() net.Addr {
+	return c.raddr
+}
+
+type streamConn struct {
+	net.Conn
+}
+
+var _ transport.StreamConn = (*streamConn)(nil)
+
+// TODO: Support a "half-closed" state.
+func (c *streamConn) CloseRead() error {
+	return c.Close()
+}
+
+func (c *streamConn) CloseWrite() error {
+	return c.Close()
 }
 
 func main() {
