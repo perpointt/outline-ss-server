@@ -22,8 +22,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	outline_prometheus "github.com/Jigsaw-Code/outline-ss-server/prometheus"
-	outline "github.com/Jigsaw-Code/outline-ss-server/service"
+	outline_prometheus "github.com/perpointt/outline-ss-server/prometheus"
+	outline "github.com/perpointt/outline-ss-server/service"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/prometheus/client_golang/prometheus"
 )

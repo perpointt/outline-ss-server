@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Jigsaw-Code/outline-ss-server/prometheus"
+	"github.com/perpointt/outline-ss-server/prometheus"
 )
 
 func TestRunOutlineServer(t *testing.T) {

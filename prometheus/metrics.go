@@ -22,9 +22,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Jigsaw-Code/outline-ss-server/ipinfo"
-	"github.com/Jigsaw-Code/outline-ss-server/service"
-	"github.com/Jigsaw-Code/outline-ss-server/service/metrics"
+	"github.com/perpointt/outline-ss-server/ipinfo"
+	"github.com/perpointt/outline-ss-server/service"
+	"github.com/perpointt/outline-ss-server/service/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

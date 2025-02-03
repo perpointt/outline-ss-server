@@ -26,7 +26,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/mholt/caddy-l4/layer4"
 
-	outline "github.com/Jigsaw-Code/outline-ss-server/service"
+	outline "github.com/perpointt/outline-ss-server/service"
 )
 
 const ssModuleName = "layer4.handlers.shadowsocks"
