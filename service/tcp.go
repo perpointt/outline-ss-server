@@ -349,7 +349,7 @@ func (h *streamHandler) handleConnection(ctx context.Context, outerConn transpor
 
 	// Логирование access key с маскировкой для безопасности.
 	maskedID := maskKey(id)
-	h.logger.Info("New connection",
+	slog.Info("New connection",
 		"remoteAddr", outerConn.RemoteAddr().String(),
 		"accessKey", maskedID)
 
