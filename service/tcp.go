@@ -320,9 +320,16 @@ func proxyConnection(l *slog.Logger, ctx context.Context, dialer transport.Strea
 	}
 	return nil
 }
+// maskKey скрывает центральную часть ключа, показывая только первые и последние 4 символа.
+func maskKey(key string) string {
+	if len(key) < 8 {
+		return key
+	}
+	return key[:4] + "****" + key[len(key)-4:]
+}
 
 func (h *streamHandler) handleConnection(ctx context.Context, outerConn transport.StreamConn, connMetrics TCPConnMetrics, proxyMetrics *metrics.ProxyMetrics) *onet.ConnectionError {
-	// Set a deadline to receive the address to the target.
+	// Устанавливаем дедлайн для получения адреса целевого сервера.
 	readDeadline := time.Now().Add(h.readTimeout)
 	if deadline, ok := ctx.Deadline(); ok {
 		outerConn.SetDeadline(deadline)
@@ -332,20 +339,29 @@ func (h *streamHandler) handleConnection(ctx context.Context, outerConn transpor
 	}
 	outerConn.SetReadDeadline(readDeadline)
 
+	// Аутентификация соединения.
 	id, innerConn, authErr := h.authenticate(outerConn)
 	if authErr != nil {
-		// Drain to protect against probing attacks.
+		// Сливаем данные для защиты от атак, направленных на зондирование.
 		h.absorbProbe(outerConn, connMetrics, authErr.Status, proxyMetrics)
 		return authErr
 	}
+
+	// Логирование access key с маскировкой для безопасности.
+	maskedID := maskKey(id)
+	h.logger.Info("New connection",
+		"remoteAddr", outerConn.RemoteAddr().String(),
+		"accessKey", maskedID)
+
+	// Обновляем метрики аутентификации.
 	connMetrics.AddAuthentication(id)
 
-	// Read target address and dial it.
+	// Чтение целевого адреса и установка соединения.
 	tgtAddr, err := getProxyRequest(innerConn)
-	// Clear the deadline for the target address
+	// Сбрасываем дедлайн для чтения адреса.
 	outerConn.SetReadDeadline(time.Time{})
 	if err != nil {
-		// Drain to prevent a close on cipher error.
+		// Сливаем данные, чтобы избежать закрытия при ошибке шифрования.
 		io.Copy(io.Discard, outerConn)
 		return onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", err)
 	}
