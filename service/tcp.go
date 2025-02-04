@@ -329,7 +329,6 @@ func maskKey(key string) string {
 }
 
 func (h *streamHandler) handleConnection(ctx context.Context, outerConn transport.StreamConn, connMetrics TCPConnMetrics, proxyMetrics *metrics.ProxyMetrics) *onet.ConnectionError {
-	slog.Info("DEBUG: handleConnection called", "timestamp", time.Now().Format(time.RFC3339))
 	// Устанавливаем дедлайн для получения адреса целевого сервера.
 	readDeadline := time.Now().Add(h.readTimeout)
 	if deadline, ok := ctx.Deadline(); ok {
@@ -343,15 +342,13 @@ func (h *streamHandler) handleConnection(ctx context.Context, outerConn transpor
 	// Аутентификация соединения.
 	id, innerConn, authErr := h.authenticate(outerConn)
 	if authErr != nil {
-		slog.Info("DEBUG: authentication failed", "error", authErr)
 		h.absorbProbe(outerConn, connMetrics, authErr.Status, proxyMetrics)
 		return authErr
 	}
-	slog.Info("DEBUG: authentication succeeded", "id", id)
 
 	// Логирование access key с маскировкой для безопасности.
 	maskedID := maskKey(id)
-	slog.Info("New connection",
+	h.logger.Info("New connection",
 		"remoteAddr", outerConn.RemoteAddr().String(),
 		"accessKey", maskedID)
 

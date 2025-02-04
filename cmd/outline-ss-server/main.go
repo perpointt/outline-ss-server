@@ -452,12 +452,7 @@ func (c replaceAddrConn) RemoteAddr() net.Addr {
 }
 
 func main() {
-    handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-        Level: slog.LevelInfo,
-    })
-    slog.SetDefault(slog.New(handler))
-
-	slog.Info("DEBUG: slog SetDefault", "timestamp", time.Now().Format(time.RFC3339))
+    slog.SetDefault(slog.New(logHandler))
 
 	var flags struct {
 		ConfigFile    string
